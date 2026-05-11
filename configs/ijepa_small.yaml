@@ -1,0 +1,35 @@
+# I-JEPA Small configuration for BigEarthNet-S2 (120x120, 10 bands)
+model:
+  img_size: 120
+  in_chans: 10
+  patch_size: 8          # 120/8 = 15 patches per side -> 225 patches total
+  embed_dim: 384         # ViT-Small
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  drop_path_rate: 0.1
+  predictor:
+    embed_dim: 192
+    depth: 6
+    num_heads: 3
+
+ijepa:
+  ema_decay: 0.996
+  ema_end_decay: 1.0
+  ema_anneal_end_decay: null  # steps
+  target_blocks: 4            # number of target blocks
+  target_block_scale: 0.15    # fraction of image for each target block
+  context_scale: 0.85         # fraction of image kept as context
+  normalize_target: true
+
+training:
+  batch_size: 256
+  epochs: 100
+  lr: 1.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 10
+  optimizer: adamw
+  mixed_precision: true
+  num_workers: 8
+  save_every_n_epochs: 10
+  seed: 42
