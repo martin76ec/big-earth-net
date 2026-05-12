@@ -20,7 +20,7 @@ phase_0() {
     local sess="data_setup"
     tmux new-session -d -s "$sess" -n "extract"
     tmux send-keys -t "$sess" "cd $PROJECT_ROOT && python src/data/extract_and_downsample.py \
-        --tar_path /home/elarreaa/big-earth-data/BigEarthNet-S2.tar.zst \
+        --tar_path /home/elarreaa/big-earth-data/data/BigEarthNet-S2.tar.zst \
         --output_dir data/processed/bigearthnet_25k_singlelabel \
         --max_patches 25000 \
         --single_label_strategy first \
