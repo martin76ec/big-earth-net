@@ -46,9 +46,9 @@ phase_2() {
     tmux new-session -d -s "$sess" -n "extract"
     tmux send-keys -t "$sess" "cd $PROJECT_ROOT && python src/train/extract_features.py \
         --model_type ijepa \
-        --checkpoint checkpoints/ijepa/ijepa_best.ckpt \
+        --checkpoint checkpoints/ijepa/ijepa-best.ckpt \
         --data_dir data/processed/bigearthnet_25k_singlelabel \
-        --output data/processed/ijepa_embeddings.npy \
+        --output data/processed/ijepa_embeddings.npz \
         > $LOG_DIR/phase2_$(timestamp).log 2>&1" C-m
     echo "[Phase 2] Session '$sess' started."
 }
@@ -59,7 +59,7 @@ phase_3() {
     tmux send-keys -t "$sess" "cd $PROJECT_ROOT && python src/train/extract_features.py \
         --model_type resnet50 \
         --data_dir data/processed/bigearthnet_25k_singlelabel \
-        --output data/processed/resnet50_embeddings.npy \
+        --output data/processed/resnet50_embeddings.npz \
         > $LOG_DIR/phase3_$(timestamp).log 2>&1" C-m
     echo "[Phase 3] Session '$sess' started."
 }

@@ -25,12 +25,22 @@ def main():
     for k, v in cfg.get("ijepa", {}).items():
         model_cfg[k] = v
 
-    model = IJEPA(model_cfg).cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = IJEPA(model_cfg).to(device)
     B = 4
-    x = torch.randn(B, 10, 120, 120).cuda()
+    x = torch.randn(B, 10, 120, 120, device=device)
     num_patches = model.context_encoder.patch_embed.num_patches
-    target_masks = [torch.randint(0, 2, (B, num_patches), dtype=torch.bool).cuda() for _ in range(4)]
-    context_mask = torch.randint(0, 2, (B, num_patches), dtype=torch.bool).cuda()
+    num_target_blocks = model_cfg.get("target_blocks", 4)
+    block_size = max(1, int(num_patches * model_cfg.get("target_block_scale", 0.15)))
+    context_size = max(1, int(num_patches * model_cfg.get("context_scale", 0.5)))
+    target_masks = [
+        torch.stack([torch.randperm(num_patches, device=device)[:block_size].sort().values for _ in range(B)])
+        for _ in range(num_target_blocks)
+    ]
+    context_mask = torch.stack([
+        torch.randperm(num_patches, device=device)[:context_size].sort().values
+        for _ in range(B)
+    ])
 
     loss = model(x, target_masks, context_mask)
     assert loss.dim() == 0, "Loss should be scalar"

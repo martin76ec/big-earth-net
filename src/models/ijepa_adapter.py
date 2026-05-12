@@ -1,73 +1,101 @@
 """
-Simplified I-JEPA adapter for 10-band BigEarthNet-S2.
+Reference-style I-JEPA adaptation for 10-band BigEarthNet-S2.
 
-Architecture:
-- Context encoder: ViT (vision transformer)
-- Target encoder: EMA of context encoder (stop-gradient)
-- Predictor: lightweight ViT that predicts target representations from context
+This module adapts the public facebookresearch/ijepa architecture patterns:
+- fixed 2D sin-cos positional embeddings
+- masked token gathering for context/target blocks
+- separate predictor operating on context tokens plus mask tokens
+- EMA target encoder updated outside gradient flow
 
-Based on the I-JEPA paper (Assran et al., 2023) and adapted for 120x120x10 input.
+The implementation is kept self-contained so it can run inside the course repo
+without pulling the upstream package at runtime.
 
 AI-assist prompt:
-"Implement a simplified I-JEPA model in PyTorch for 10-channel 120x120 images.
-Include a Vision Transformer encoder, an EMA target encoder, a predictor network,
-and the JEPA masking/target-block loss. Keep it modular for PyTorch Lightning."
+"Adapt the public I-JEPA reference architecture into a self-contained PyTorch
+module for 10-channel 120x120 BigEarthNet patches, preserving the reference
+encoder/predictor/masking flow while avoiding an external runtime dependency."
 """
 
 import math
-from typing import Tuple
+from functools import partial
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class PatchEmbed(nn.Module):
-    """Patch embedding layer adapted for arbitrary input channels."""
-    def __init__(self, img_size=120, patch_size=8, in_chans=10, embed_dim=384):
+def trunc_normal_(tensor, mean=0.0, std=1.0):
+    return nn.init.trunc_normal_(tensor, mean=mean, std=std)
+
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size):
+    grid_h = np.arange(grid_size, dtype=float)
+    grid_w = np.arange(grid_size, dtype=float)
+    grid = np.meshgrid(grid_w, grid_h)
+    grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
+    return get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+    return np.concatenate([emb_h, emb_w], axis=1)
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=float)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega
+    pos = pos.reshape(-1)
+    out = np.einsum("m,d->md", pos, omega)
+    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
+
+
+def apply_masks(x, masks):
+    all_x = []
+    for mask in masks:
+        index = mask.unsqueeze(-1).repeat(1, 1, x.size(-1))
+        all_x.append(torch.gather(x, dim=1, index=index))
+    return torch.cat(all_x, dim=0)
+
+
+def repeat_interleave_batch(x, batch_size, repeat):
+    chunks = torch.chunk(x, len(x) // batch_size, dim=0)
+    repeated = []
+    for chunk in chunks:
+        repeated.extend([chunk] * repeat)
+    return torch.cat(repeated, dim=0)
+
+
+def drop_path(x, drop_prob=0.0, training=False):
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    return x.div(keep_prob) * random_tensor
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=None):
         super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.drop_prob = drop_prob
 
     def forward(self, x):
-        # x: (B, C, H, W)
-        x = self.proj(x)  # (B, embed_dim, H/P, W/P)
-        x = x.flatten(2).transpose(1, 2)  # (B, N, embed_dim)
-        return x
-
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=6, qkv_bias=False, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        self.scale = (dim // num_heads) ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        return drop_path(x, self.drop_prob, self.training)
 
 
 class MLP(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.0):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
+        self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
@@ -80,23 +108,59 @@ class MLP(nn.Module):
         return x
 
 
-class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0.):
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = Attention(dim, num_heads, qkv_bias, attn_drop, drop)
-        self.norm2 = nn.LayerNorm(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = MLP(dim, mlp_hidden_dim, drop=drop)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        batch_size, num_tokens, dim = x.shape
+        qkv = self.qkv(x).reshape(batch_size, num_tokens, 3, self.num_heads, dim // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(batch_size, num_tokens, dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
         return x
 
 
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, qkv_bias=False, drop=0.0, attn_drop=0.0, drop_path_rate=0.0, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = MLP(dim, int(dim * mlp_ratio), act_layer=nn.GELU, drop=drop)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=120, patch_size=8, in_chans=10, embed_dim=384):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        return self.proj(x).flatten(2).transpose(1, 2)
+
+
 class VisionTransformer(nn.Module):
-    """ViT encoder for I-JEPA."""
     def __init__(
         self,
         img_size=120,
@@ -105,101 +169,148 @@ class VisionTransformer(nn.Module):
         embed_dim=384,
         depth=12,
         num_heads=6,
-        mlp_ratio=4.,
-        qkv_bias=False,
-        drop_rate=0.,
-        attn_drop_rate=0.,
-        drop_path_rate=0.,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        init_std=0.02,
     ):
         super().__init__()
-        self.num_features = embed_dim
-        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_rate)
-
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim), requires_grad=False)
+        pos_embed = get_2d_sincos_pos_embed(embed_dim, int(num_patches**0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias, drop_rate, attn_drop_rate, dpr[i])
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias, drop_rate, attn_drop_rate, dpr[i], norm_layer)
             for i in range(depth)
         ])
-        self.norm = nn.LayerNorm(embed_dim)
-
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.norm = norm_layer(embed_dim)
+        self.init_std = init_std
         self.apply(self._init_weights)
+        self.fix_init_weight()
 
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+    def fix_init_weight(self):
+        def rescale(param, layer_id):
+            param.div_(math.sqrt(2.0 * layer_id))
 
-    def forward(self, x, return_all_tokens=False):
-        B = x.shape[0]
+        for layer_id, layer in enumerate(self.blocks):
+            rescale(layer.attn.proj.weight.data, layer_id + 1)
+            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            trunc_normal_(module.weight, std=self.init_std)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+        elif isinstance(module, nn.Conv2d):
+            trunc_normal_(module.weight, std=self.init_std)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def forward(self, x, masks=None):
         x = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
-        x = self.pos_drop(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)
-        if return_all_tokens:
-            return x
-        return x[:, 0]  # cls token
+        if masks is not None:
+            if not isinstance(masks, list):
+                masks = [masks]
+            x = apply_masks(x, masks)
+        for block in self.blocks:
+            x = block(x)
+        return self.norm(x)
 
 
-class Predictor(nn.Module):
-    """Lightweight ViT predictor."""
-    def __init__(self, embed_dim=384, predictor_embed_dim=192, depth=6, num_heads=3, mlp_ratio=4.):
+class VisionTransformerPredictor(nn.Module):
+    def __init__(
+        self,
+        num_patches,
+        embed_dim=384,
+        predictor_embed_dim=192,
+        depth=6,
+        num_heads=3,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        init_std=0.02,
+    ):
         super().__init__()
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
-
+        self.predictor_pos_embed = nn.Parameter(torch.zeros(1, num_patches, predictor_embed_dim), requires_grad=False)
+        pos_embed = get_2d_sincos_pos_embed(predictor_embed_dim, int(num_patches**0.5))
+        self.predictor_pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
-            Block(predictor_embed_dim, num_heads, mlp_ratio, qkv_bias=True)
-            for _ in range(depth)
+            Block(predictor_embed_dim, num_heads, mlp_ratio, qkv_bias, drop_rate, attn_drop_rate, dpr[i], norm_layer)
+            for i in range(depth)
         ])
-        self.norm = nn.LayerNorm(predictor_embed_dim)
+        self.norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
-
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        self.init_std = init_std
+        trunc_normal_(self.mask_token, std=self.init_std)
         self.apply(self._init_weights)
+        self.fix_init_weight()
 
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+    def fix_init_weight(self):
+        def rescale(param, layer_id):
+            param.div_(math.sqrt(2.0 * layer_id))
 
-    def forward(self, x, mask=None):
-        # x: (B, N, embed_dim) context representations
+        for layer_id, layer in enumerate(self.blocks):
+            rescale(layer.attn.proj.weight.data, layer_id + 1)
+            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            trunc_normal_(module.weight, std=self.init_std)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+        elif isinstance(module, nn.Conv2d):
+            trunc_normal_(module.weight, std=self.init_std)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def forward(self, x, masks_x, masks):
+        if not isinstance(masks_x, list):
+            masks_x = [masks_x]
+        if not isinstance(masks, list):
+            masks = [masks]
+
+        batch_size = len(x) // len(masks_x)
         x = self.predictor_embed(x)
-        if mask is not None:
-            B, N, C = x.shape
-            mask_tokens = self.mask_token.expand(B, N, -1)
-            w = mask.float().unsqueeze(-1)
-            x = x * (1 - w) + mask_tokens * w
-        for blk in self.blocks:
-            x = blk(x)
+        pos_x = self.predictor_pos_embed.repeat(batch_size, 1, 1)
+        x = x + apply_masks(pos_x, masks_x)
+
+        _, num_context, _ = x.shape
+        pos_targets = self.predictor_pos_embed.repeat(batch_size, 1, 1)
+        pos_targets = apply_masks(pos_targets, masks)
+        pos_targets = repeat_interleave_batch(pos_targets, batch_size, repeat=len(masks_x))
+        pred_tokens = self.mask_token.repeat(pos_targets.size(0), pos_targets.size(1), 1)
+        pred_tokens = pred_tokens + pos_targets
+
+        x = x.repeat(len(masks), 1, 1)
+        x = torch.cat([x, pred_tokens], dim=1)
+        for block in self.blocks:
+            x = block(x)
         x = self.norm(x)
-        x = self.predictor_proj(x)
-        return x
+        x = x[:, num_context:]
+        return self.predictor_proj(x)
 
 
 class IJEPA(nn.Module):
-    """
-    Full I-JEPA model: context encoder, target encoder (EMA), predictor, masking.
-    """
     def __init__(self, config: dict):
         super().__init__()
         self.cfg = config
@@ -223,13 +334,12 @@ class IJEPA(nn.Module):
             mlp_ratio=config.get("mlp_ratio", 4.0),
             drop_path_rate=config.get("drop_path_rate", 0.1),
         )
-        # Initialize target encoder with context encoder weights
         self.target_encoder.load_state_dict(self.context_encoder.state_dict())
-        # Disable gradients for target encoder
-        for p in self.target_encoder.parameters():
-            p.requires_grad = False
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
 
-        self.predictor = Predictor(
+        self.predictor = VisionTransformerPredictor(
+            num_patches=self.context_encoder.patch_embed.num_patches,
             embed_dim=config["embed_dim"],
             predictor_embed_dim=config["predictor"]["embed_dim"],
             depth=config["predictor"]["depth"],
@@ -238,69 +348,29 @@ class IJEPA(nn.Module):
         )
 
     def forward_target(self, x, target_masks):
-        """Extract target representations (no grad)."""
         with torch.no_grad():
-            h = self.target_encoder(x, return_all_tokens=True)
-            # h: (B, N+1, D); we ignore cls token at index 0
-            h = h[:, 1:, :]  # (B, N, D)
-            B = h.shape[0]
-            # target_masks: list of (B, N) bool tensors, one per target block
-            targets = []
-            for mask in target_masks:
-                # Average pooled representation of masked patches
-                mask_expanded = mask.unsqueeze(-1).float()  # (B, N, 1)
-                target_rep = (h * mask_expanded).sum(dim=1) / (mask_expanded.sum(dim=1) + 1e-6)
-                targets.append(target_rep)
-            targets = torch.stack(targets, dim=1)  # (B, num_targets, D)
+            target_features = self.target_encoder(x)
+            target_features = apply_masks(target_features, target_masks)
             if self.cfg.get("normalize_target", True):
-                targets = F.layer_norm(targets, targets.shape[-1:])
-        return targets
+                target_features = F.layer_norm(target_features, target_features.shape[-1:])
+        return target_features
 
-    def forward_context(self, x, context_mask):
-        """Extract context representations and predict targets."""
-        h = self.context_encoder(x, return_all_tokens=True)
-        h = h[:, 1:, :]  # remove cls token, (B, N, D)
-        B, N, D = h.shape
-        # Apply context mask: set non-context patches to zero
-        context_mask_expanded = context_mask.unsqueeze(-1).float()
-        h = h * context_mask_expanded
+    def forward_context(self, x, context_masks, target_masks):
+        context_features = self.context_encoder(x, masks=context_masks)
+        return self.predictor(context_features, context_masks, target_masks)
 
-        # Predict target representations for all positions
-        pred = self.predictor(h)  # (B, N, D)
-        return pred
-
-    def forward(self, x, target_masks, context_mask):
-        """
-        x: (B, C, H, W)
-        target_masks: list of (B, N) bool tensors
-        context_mask: (B, N) bool tensor
-        Returns loss scalar.
-        """
+    def forward(self, x, target_masks, context_masks):
         targets = self.forward_target(x, target_masks)
-        pred = self.forward_context(x, context_mask)
-
-        # Gather predicted representations for target patches
-        B = x.shape[0]
-        num_targets = len(target_masks)
-        loss = 0
-        for i, mask in enumerate(target_masks):
-            # mask: (B, N)
-            mask_expanded = mask.unsqueeze(-1).float()
-            pred_target = (pred * mask_expanded).sum(dim=1) / (mask_expanded.sum(dim=1) + 1e-6)
-            # L2 loss in predictor space
-            loss += F.mse_loss(pred_target, targets[:, i, :])
-        loss = loss / num_targets
-        return loss
+        predictions = self.forward_context(x, context_masks, target_masks)
+        return F.smooth_l1_loss(predictions, targets)
 
     def update_target_encoder(self, ema_decay):
-        """Exponential moving average update of target encoder."""
         with torch.no_grad():
-            for param_q, param_k in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
-                param_k.data.mul_(ema_decay).add_((1. - ema_decay) * param_q.data)
+            for source, target in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+                target.data.mul_(ema_decay).add_((1.0 - ema_decay) * source.data)
 
 
 class IJEPAFeatureExtractor(nn.Module):
-    """Wrapper to extract fixed-size embeddings from the trained context encoder."""
     def __init__(self, context_encoder: VisionTransformer):
         super().__init__()
         self.encoder = context_encoder
@@ -308,4 +378,5 @@ class IJEPAFeatureExtractor(nn.Module):
 
     @torch.no_grad()
     def forward(self, x):
-        return self.encoder(x, return_all_tokens=False)
+        tokens = self.encoder(x)
+        return tokens.mean(dim=1)

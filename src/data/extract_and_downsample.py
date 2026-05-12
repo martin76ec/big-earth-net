@@ -14,7 +14,6 @@ import json
 import os
 import random
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -22,18 +21,21 @@ import rasterio
 from tqdm import tqdm
 
 
+EXPECTED_BANDS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+
+
 def extract_tar_zst(tar_path: str, output_dir: str) -> str:
     """Extract tar.zst to output_dir. Return root folder inside."""
     os.makedirs(output_dir, exist_ok=True)
-    print(f"[extract] Decompressing {tar_path} -> {output_dir} ...")
-    # zstd -d --stdout BigEarthNet-S2.tar.zst | tar -x -C output_dir
-    # Using tar with --zstd if available, else pipe
-    cmd = (
-        f"zstd -d --stdout '{tar_path}' | tar -x -C '{output_dir}'"
-    )
-    ret = subprocess.call(cmd, shell=True)
-    if ret != 0:
-        raise RuntimeError(f"Extraction failed with code {ret}")
+    existing_entries = [e for e in os.listdir(output_dir) if not e.startswith(".")]
+    if existing_entries:
+        print(f"[extract] Reusing existing extracted data in {output_dir}")
+    else:
+        print(f"[extract] Decompressing {tar_path} -> {output_dir} ...")
+        cmd = f"zstd -d --stdout '{tar_path}' | tar -x -C '{output_dir}'"
+        ret = subprocess.call(cmd, shell=True)
+        if ret != 0:
+            raise RuntimeError(f"Extraction failed with code {ret}")
 
     # Determine the actual root folder inside output_dir
     entries = [e for e in os.listdir(output_dir) if os.path.isdir(os.path.join(output_dir, e))]
@@ -57,6 +59,29 @@ def find_patches(root: str):
         yield str(patch_dir), str(json_files[0])
 
 
+def select_band_files(patch_dir: str):
+    tif_paths = list(Path(patch_dir).glob("*.tif"))
+    if not tif_paths:
+        return []
+
+    by_name = {tif.stem.upper(): tif for tif in tif_paths}
+    selected = []
+    for band in EXPECTED_BANDS:
+        match = next((path for stem, path in by_name.items() if stem.endswith(f"_{band}") or stem == band), None)
+        if match is None:
+            selected = []
+            break
+        selected.append(match)
+
+    if selected:
+        return selected
+
+    tif_paths = sorted(tif_paths)
+    if len(tif_paths) == len(EXPECTED_BANDS):
+        return tif_paths
+    return []
+
+
 def single_label_from_json(json_path: str, strategy: str = "first") -> str:
     """Return a single label string from a BigEarthNet label JSON."""
     with open(json_path, "r") as f:
@@ -78,8 +103,8 @@ def compute_band_stats(patch_dirs: list, max_patches: int = 500) -> dict:
     count = 0
     sample = patch_dirs if len(patch_dirs) <= max_patches else random.sample(patch_dirs, max_patches)
     for patch_dir in tqdm(sample, desc="band stats"):
-        tifs = sorted(Path(patch_dir).glob("*.tif"))
-        if len(tifs) != 10:
+        tifs = select_band_files(patch_dir)
+        if len(tifs) != len(EXPECTED_BANDS):
             continue
         bands = []
         for tif in tifs:
@@ -112,23 +137,54 @@ def main():
 
     # Step 1: enumerate patches
     patches = list(find_patches(extracted_root))
-    print(f"[extract] Found {len(patches)} total patches.")
+    print(f"[extract] Found {len(patches)} total patch directories with labels.")
 
-    if len(patches) < args.max_patches:
-        print(f"[WARN] Requested {args.max_patches} but only {len(patches)} available. Using all.")
-        selected = patches
-    else:
-        selected = random.sample(patches, args.max_patches)
-
-    # Step 2: build metadata
-    metadata = []
-    for patch_dir, json_path in tqdm(selected, desc="parsing labels"):
-        label = single_label_from_json(json_path, strategy=args.single_label_strategy)
-        metadata.append({
+    metadata_all = []
+    skipped_missing_bands = 0
+    for patch_dir, json_path in tqdm(patches, desc="validating patches"):
+        band_files = select_band_files(patch_dir)
+        if len(band_files) != len(EXPECTED_BANDS):
+            skipped_missing_bands += 1
+            continue
+        with open(json_path, "r") as f:
+            raw = json.load(f)
+        all_labels = raw.get("labels", [])
+        metadata_all.append({
             "patch_dir": patch_dir,
             "label_json": json_path,
-            "single_label": label,
+            "single_label": single_label_from_json(json_path, strategy=args.single_label_strategy),
+            "all_labels": all_labels,
+            "band_files": [str(path) for path in band_files],
         })
+
+    print(f"[extract] Valid patches with expected bands: {len(metadata_all)}")
+    if skipped_missing_bands:
+        print(f"[extract] Skipped {skipped_missing_bands} patches with unexpected band files")
+
+    if len(metadata_all) < args.max_patches:
+        print(f"[WARN] Requested {args.max_patches} but only {len(metadata_all)} valid patches available. Using all.")
+        metadata = metadata_all
+    else:
+        by_label = {}
+        for item in metadata_all:
+            by_label.setdefault(item["single_label"], []).append(item)
+
+        target_total = args.max_patches
+        selected = []
+        label_names = sorted(by_label)
+        base_per_label = max(1, target_total // max(1, len(label_names)))
+        leftovers = []
+        for label in label_names:
+            items = by_label[label]
+            take = min(len(items), base_per_label)
+            selected.extend(random.sample(items, take))
+            if len(items) > take:
+                leftovers.extend(item for item in items if item not in selected)
+
+        if len(selected) < target_total:
+            remaining = target_total - len(selected)
+            selected.extend(random.sample(leftovers, min(remaining, len(leftovers))))
+        metadata = selected[:target_total]
 
     # Step 3: compute stats
     stats = compute_band_stats([m["patch_dir"] for m in metadata], max_patches=500)
@@ -142,6 +198,7 @@ def main():
             "band_stats": stats,
             "num_patches": len(metadata),
             "strategy": args.single_label_strategy,
+            "expected_bands": EXPECTED_BANDS,
         }, f, indent=2)
     print(f"[save] Metadata written to {meta_path}")
     print(f"[save] Total patches: {len(metadata)}")

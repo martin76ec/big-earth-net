@@ -8,6 +8,7 @@ and saves embeddings and labels as numpy arrays."
 
 import argparse
 import json
+import os
 
 import numpy as np
 import pytorch_lightning as pl
@@ -82,6 +83,9 @@ def main():
     else:
         raise ValueError(args.model_type)
 
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     embeddings, labels = extract(model, dataloader, device)
     np.savez(args.output, embeddings=embeddings, labels=labels, label_names=unique_labels)
     print(f"[extract] Saved {embeddings.shape} embeddings to {args.output}")

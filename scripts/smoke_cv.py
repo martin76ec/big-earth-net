@@ -20,7 +20,7 @@ def main():
 
     clf = Pipeline([
         ("scaler", StandardScaler()),
-        ("lr", LogisticRegression(max_iter=200, multi_class="multinomial", solver="lbfgs")),
+        ("lr", LogisticRegression(max_iter=200, solver="lbfgs")),
     ])
 
     cv = RepeatedStratifiedKFold(n_splits=2, n_repeats=2, random_state=42)

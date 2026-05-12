@@ -11,41 +11,42 @@ import random
 
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 import yaml
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from src.models.ijepa_adapter import IJEPA
 
 
-def sample_target_block(num_patches, target_scale):
-    """Sample a contiguous square block of patches."""
-    H = W = int(math.sqrt(num_patches))
-    block_h = max(1, int(H * math.sqrt(target_scale)))
-    block_w = max(1, int(W * math.sqrt(target_scale)))
-    top = random.randint(0, H - block_h)
-    left = random.randint(0, W - block_w)
-    mask = torch.zeros(H * W, dtype=torch.bool)
-    for i in range(top, top + block_h):
-        for j in range(left, left + block_w):
-            idx = i * W + j
-            if idx < num_patches:
-                mask[idx] = True
-    return mask
+def sample_target_block_indices(num_patches, target_scale):
+    """Sample a contiguous square target block and return patch indices."""
+    grid_size = int(math.sqrt(num_patches))
+    block_h = max(1, int(grid_size * math.sqrt(target_scale)))
+    block_w = max(1, int(grid_size * math.sqrt(target_scale)))
+    block_h = min(block_h, grid_size)
+    block_w = min(block_w, grid_size)
+    top = random.randint(0, grid_size - block_h)
+    left = random.randint(0, grid_size - block_w)
+    indices = []
+    for row in range(top, top + block_h):
+        for col in range(left, left + block_w):
+            indices.append(row * grid_size + col)
+    return torch.tensor(indices, dtype=torch.long)
 
 
-def sample_context_mask(num_patches, context_scale, target_masks):
-    """Sample context mask ensuring minimal overlap with target blocks."""
-    # Start with random sampling
-    n_keep = int(num_patches * context_scale)
-    indices = torch.randperm(num_patches)[:n_keep]
-    mask = torch.zeros(num_patches, dtype=torch.bool)
-    mask[indices] = True
-    # Remove target patches from context
-    for tm in target_masks:
-        mask = mask & (~tm)
-    return mask
+def sample_context_indices(num_patches, context_scale, target_masks):
+    """Sample context patch indices from the complement of the target blocks."""
+    available = torch.ones(num_patches, dtype=torch.bool)
+    for target_mask in target_masks:
+        available[target_mask] = False
+    available_indices = torch.nonzero(available, as_tuple=False).squeeze(1)
+    if available_indices.numel() == 0:
+        return torch.arange(num_patches, dtype=torch.long)
+
+    desired = max(1, int(num_patches * context_scale))
+    count = min(desired, available_indices.numel())
+    chosen = available_indices[torch.randperm(available_indices.numel())[:count]]
+    return chosen.sort().values
 
 
 class IJEPAModule(pl.LightningModule):
@@ -69,13 +70,26 @@ class IJEPAModule(pl.LightningModule):
         B = x.shape[0]
         device = x.device
 
-        # Sample target blocks and context mask per image
-        target_masks = []
-        for _ in range(self.num_target_blocks):
-            masks = torch.stack([sample_target_block(self.num_patches, self.target_block_scale) for _ in range(B)])
-            target_masks.append(masks.to(device))
+        # Sample target/context indices using the reference I-JEPA masking pattern.
+        target_masks_per_image = []
+        context_masks_per_image = []
+        for _ in range(B):
+            targets_for_image = [sample_target_block_indices(self.num_patches, self.target_block_scale) for _ in range(self.num_target_blocks)]
+            context_for_image = sample_context_indices(self.num_patches, self.context_scale, targets_for_image)
+            target_masks_per_image.append(targets_for_image)
+            context_masks_per_image.append(context_for_image)
 
-        context_masks = torch.stack([sample_context_mask(self.num_patches, self.context_scale, [tm[i] for tm in target_masks]) for i in range(B)]).to(device)
+        context_width = min(mask.numel() for mask in context_masks_per_image)
+        context_masks = torch.stack([mask[:context_width] for mask in context_masks_per_image]).to(device)
+
+        target_masks = []
+        for target_idx in range(self.num_target_blocks):
+            block_width = min(target_masks_per_image[sample_idx][target_idx].numel() for sample_idx in range(B))
+            stacked = torch.stack([
+                target_masks_per_image[sample_idx][target_idx][:block_width]
+                for sample_idx in range(B)
+            ])
+            target_masks.append(stacked.to(device))
 
         loss = self.model(x, target_masks, context_masks)
         self.log("train_loss", loss, prog_bar=True, on_epoch=True)
@@ -93,17 +107,24 @@ class IJEPAModule(pl.LightningModule):
         # Also add predictor params
         optimizer.add_param_group({"params": self.model.predictor.parameters()})
 
-        total_steps = self.trainer.estimated_stepping_batches
-        warmup_steps = self.cfg.get("warmup_epochs", 10) * self.trainer.num_training_batches
-
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return float(step) / float(max(1, warmup_steps))
-            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        scheduler = LambdaLR(optimizer, lr_lambda)
-        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
+        warmup_epochs = self.cfg.get("warmup_epochs", 10)
+        total_epochs = self.cfg["epochs"]
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=max(1, warmup_epochs),
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, total_epochs - warmup_epochs),
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
 
 def main():
@@ -123,6 +144,10 @@ def main():
         cfg = yaml.safe_load(f)
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]
+    model_cfg["epochs"] = train_cfg["epochs"]
+    model_cfg["lr"] = train_cfg["lr"]
+    model_cfg["weight_decay"] = train_cfg["weight_decay"]
+    model_cfg["warmup_epochs"] = train_cfg.get("warmup_epochs", 10)
     # Merge I-JEPA hparams into model_cfg
     for k, v in cfg.get("ijepa", {}).items():
         model_cfg[k] = v
@@ -131,6 +156,7 @@ def main():
         train_cfg["batch_size"] = args.batch_size
     if args.epochs:
         train_cfg["epochs"] = args.epochs
+        model_cfg["epochs"] = args.epochs
 
     pl.seed_everything(args.seed)
 
@@ -147,12 +173,11 @@ def main():
 
     checkpoint_cb = pl.callbacks.ModelCheckpoint(
         dirpath=args.output_dir,
-        filename="ijepa_{epoch:02d}",
+        filename="ijepa-best",
         save_top_k=1,
         monitor="train_loss",
         mode="min",
         save_last=True,
-        every_n_epochs=train_cfg.get("save_every_n_epochs", 10),
     )
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval="step")
 

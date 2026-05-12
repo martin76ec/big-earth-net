@@ -20,12 +20,31 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset
 
 
-def _read_patch(patch_dir: str, stats: dict, target_size: int = 120):
+EXPECTED_BANDS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+
+
+def _select_band_files(patch_dir: str, item: dict):
+    band_files = item.get("band_files")
+    if band_files:
+        return [Path(path) for path in band_files]
+
+    tifs = list(Path(patch_dir).glob("*.tif"))
+    by_name = {tif.stem.upper(): tif for tif in tifs}
+    selected = []
+    for band in EXPECTED_BANDS:
+        match = next((path for stem, path in by_name.items() if stem.endswith(f"_{band}") or stem == band), None)
+        if match is None:
+            return []
+        selected.append(match)
+    return selected
+
+
+def _read_patch(item: dict, stats: dict, target_size: int = 120):
     """Read 10 bands, resize to target_size, normalize with precomputed mean/std."""
-    tifs = sorted(Path(patch_dir).glob("*.tif"))
-    if len(tifs) != 10:
-        # Fallback: pad with zeros or skip
-        raise ValueError(f"Expected 10 TIFs in {patch_dir}, found {len(tifs)}")
+    patch_dir = item["patch_dir"]
+    tifs = _select_band_files(patch_dir, item)
+    if len(tifs) != len(EXPECTED_BANDS):
+        raise ValueError(f"Expected {len(EXPECTED_BANDS)} selected TIFs in {patch_dir}, found {len(tifs)}")
     bands = []
     for tif in tifs:
         with rasterio.open(tif) as src:
@@ -62,7 +81,7 @@ class BigEarthNetDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.metadata[idx]
-        img = _read_patch(item["patch_dir"], self.stats, self.target_size)
+        img = _read_patch(item, self.stats, self.target_size)
         label = self.label_to_idx[item["single_label"]]
         return img, label
 

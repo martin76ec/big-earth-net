@@ -14,6 +14,7 @@ performs a Wilcoxon signed-rank test between two models. Save all results to CSV
 
 import argparse
 import json
+import os
 import pickle
 
 import numpy as np
@@ -42,7 +43,6 @@ def build_pipeline(C: float):
             penalty="l2",
             solver="lbfgs",
             max_iter=500,
-            multi_class="multinomial",
             random_state=42,
             n_jobs=5,
         )),
@@ -105,8 +105,8 @@ def run_cv(embeddings_a_path: str, embeddings_b_path: str, best_C_a: float, best
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True, choices=["hpo", "cv"])
-    parser.add_argument("--embeddings_a", default="data/processed/ijepa_embeddings.npy")
-    parser.add_argument("--embeddings_b", default="data/processed/resnet50_embeddings.npy")
+    parser.add_argument("--embeddings_a", default="data/processed/ijepa_embeddings.npz")
+    parser.add_argument("--embeddings_b", default="data/processed/resnet50_embeddings.npz")
     parser.add_argument("--n_trials", type=int, default=50)
     parser.add_argument("--n_repeats", type=int, default=10)
     parser.add_argument("--n_folds", type=int, default=10)
@@ -114,6 +114,7 @@ def main():
     parser.add_argument("--best_C_b", type=float, default=None)
     parser.add_argument("--output_dir", default="reports/hpo")
     args = parser.parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
 
     if args.mode == "hpo":
         results = run_hpo(args.embeddings_a, args.embeddings_b, n_trials=args.n_trials)
