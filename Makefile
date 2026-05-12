@@ -1,128 +1,60 @@
 PY ?= python
-TAR_PATH ?= /home/elarreaa/big-earth-data/BigEarthNet-S2.tar.zst
 
-DATA_SMOKE ?= data/processed/bigearthnet_smoke
-DATA_FULL ?= data/processed/bigearthnet_25k_singlelabel
-
-CKPT_DIR ?= checkpoints/ijepa
-CKPT ?= $(CKPT_DIR)/ijepa-best.ckpt
-
-EMB_IJEPA_SMOKE ?= data/processed/ijepa_embeddings_smoke.npz
-EMB_RESNET_SMOKE ?= data/processed/resnet50_embeddings_smoke.npz
-EMB_IJEPA_FULL ?= data/processed/ijepa_embeddings.npz
-EMB_RESNET_FULL ?= data/processed/resnet50_embeddings.npz
-
-HPO_DIR ?= reports/hpo
-
-SMOKE_PATCHES ?= 200
-SMOKE_EPOCHS ?= 1
-SMOKE_BS ?= 16
-SMOKE_TRIALS ?= 5
-SMOKE_FOLDS ?= 3
-SMOKE_REPEATS ?= 1
-
-.PHONY: help install smoke_data_prep smoke_smoke_tests smoke_train smoke_feats smoke_hpo smoke_cv smoke_all \
-	full_data_prep full_train full_feats full_hpo full_cv full_all
+.PHONY: help install smokes phase0 phase1 phase2 phase3 phase4 phase5 all \
+	smoke_phase0 smoke_phase1 smoke_phase2 smoke_phase3 smoke_phase4 smoke_phase5 smoke_all
 
 help:
 	@echo "Targets:"
 	@echo "  make install"
-	@echo "  make smoke_all   (tiny end-to-end validation)"
-	@echo "  make full_all    (25k run)"
-	@echo "  make smoke_data_prep smoke_train smoke_feats smoke_hpo smoke_cv"
-	@echo "  make full_data_prep full_train full_feats full_hpo full_cv"
+	@echo "  make smokes         (fast sanity checks)"
+	@echo "  make phase0..phase5 (full pipeline phases)"
+	@echo "  make all            (phase0..phase5)"
+	@echo "  make smoke_all      (smoke_phase0..smoke_phase5 + smokes)"
 
 install:
 	$(PY) -m pip install -r requirements.txt
 
-smoke_data_prep:
-	$(PY) src/data/extract_and_downsample.py \
-		--tar_path $(TAR_PATH) \
-		--output_dir $(DATA_SMOKE) \
-		--max_patches $(SMOKE_PATCHES) \
-		--single_label_strategy first
-
-smoke_smoke_tests:
+smokes:
+	$(PY) scripts/smoke_data.py
+	$(PY) scripts/smoke_ijepa.py
 	$(PY) scripts/smoke_cv.py
-	$(PY) scripts/smoke_ijepa.py --config configs/ijepa_small.yaml
 
-smoke_train:
-	$(PY) src/train/ijepa_train.py \
-		--config configs/ijepa_small.yaml \
-		--data_dir $(DATA_SMOKE) \
-		--output_dir $(CKPT_DIR) \
-		--batch_size $(SMOKE_BS) \
-		--epochs $(SMOKE_EPOCHS)
+phase0:
+	$(PY) scripts/phase0_data_prep.py
 
-smoke_feats:
-	$(PY) src/train/extract_features.py \
-		--model_type ijepa \
-		--checkpoint $(CKPT) \
-		--data_dir $(DATA_SMOKE) \
-		--output $(EMB_IJEPA_SMOKE)
-	$(PY) src/train/extract_features.py \
-		--model_type resnet50 \
-		--data_dir $(DATA_SMOKE) \
-		--output $(EMB_RESNET_SMOKE)
+phase1:
+	$(PY) scripts/phase1_train.py
 
-smoke_hpo:
-	$(PY) notebooks/04_hpo_and_cv.py \
-		--mode hpo \
-		--embeddings_a $(EMB_IJEPA_SMOKE) \
-		--embeddings_b $(EMB_RESNET_SMOKE) \
-		--n_trials $(SMOKE_TRIALS) \
-		--output_dir $(HPO_DIR)
+phase2:
+	$(PY) scripts/phase2_extract_features.py --model ijepa
 
-smoke_cv:
-	$(PY) notebooks/04_hpo_and_cv.py \
-		--mode cv \
-		--embeddings_a $(EMB_IJEPA_SMOKE) \
-		--embeddings_b $(EMB_RESNET_SMOKE) \
-		--n_folds $(SMOKE_FOLDS) \
-		--n_repeats $(SMOKE_REPEATS) \
-		--output_dir $(HPO_DIR)
+phase3:
+	$(PY) scripts/phase2_extract_features.py --model resnet50
 
-smoke_all: smoke_data_prep smoke_smoke_tests smoke_train smoke_feats smoke_hpo smoke_cv
+phase4:
+	$(PY) scripts/phase4_hpo.py
 
-full_data_prep:
-	$(PY) src/data/extract_and_downsample.py \
-		--tar_path $(TAR_PATH) \
-		--output_dir $(DATA_FULL) \
-		--max_patches 25000 \
-		--single_label_strategy first
+phase5:
+	$(PY) scripts/phase5_cv.py
 
-full_train:
-	$(PY) src/train/ijepa_train.py \
-		--config configs/ijepa_small.yaml \
-		--data_dir $(DATA_FULL) \
-		--output_dir $(CKPT_DIR)
+all: phase0 phase1 phase2 phase3 phase4 phase5
 
-full_feats:
-	$(PY) src/train/extract_features.py \
-		--model_type ijepa \
-		--checkpoint $(CKPT) \
-		--data_dir $(DATA_FULL) \
-		--output $(EMB_IJEPA_FULL)
-	$(PY) src/train/extract_features.py \
-		--model_type resnet50 \
-		--data_dir $(DATA_FULL) \
-		--output $(EMB_RESNET_FULL)
+smoke_phase0:
+	$(PY) scripts/phase0_data_prep.py --smoke
 
-full_hpo:
-	$(PY) notebooks/04_hpo_and_cv.py \
-		--mode hpo \
-		--embeddings_a $(EMB_IJEPA_FULL) \
-		--embeddings_b $(EMB_RESNET_FULL) \
-		--n_trials 50 \
-		--output_dir $(HPO_DIR)
+smoke_phase1:
+	$(PY) scripts/phase1_train.py --smoke
 
-full_cv:
-	$(PY) notebooks/04_hpo_and_cv.py \
-		--mode cv \
-		--embeddings_a $(EMB_IJEPA_FULL) \
-		--embeddings_b $(EMB_RESNET_FULL) \
-		--n_folds 10 \
-		--n_repeats 10 \
-		--output_dir $(HPO_DIR)
+smoke_phase2:
+	$(PY) scripts/phase2_extract_features.py --model ijepa --smoke
 
-full_all: full_data_prep full_train full_feats full_hpo full_cv
+smoke_phase3:
+	$(PY) scripts/phase2_extract_features.py --model resnet50 --smoke
+
+smoke_phase4:
+	$(PY) scripts/phase4_hpo.py --smoke
+
+smoke_phase5:
+	$(PY) scripts/phase5_cv.py --smoke
+
+smoke_all: smokes smoke_phase0 smoke_phase1 smoke_phase2 smoke_phase3 smoke_phase4 smoke_phase5

@@ -10,16 +10,25 @@ import argparse
 import json
 from pathlib import Path
 
+from _project_paths import project_paths, find_processed_dataset_dir
+
 import numpy as np
 import rasterio
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", required=True)
+    parser.add_argument(
+        "--data_dir",
+        default=None,
+        help="Path to a processed dataset directory containing metadata.json. If omitted, searches under data/processed/.",
+    )
     args = parser.parse_args()
 
-    meta_path = Path(args.data_dir) / "metadata.json"
+    paths = project_paths()
+    data_dir = Path(args.data_dir) if args.data_dir else find_processed_dataset_dir(paths.processed_dir)
+
+    meta_path = data_dir / "metadata.json"
     assert meta_path.exists(), f"Missing {meta_path}"
 
     with open(meta_path, "r") as f:

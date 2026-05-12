@@ -6,35 +6,31 @@
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Make runbook executable
-chmod +x runbook.sh
+# 2. Put the dataset archive under data/
+#    Example: data/BigEarthNet-S2.tar.zst
 
-# 3. Phase 0 — Extract & downsample data (detached tmux session)
-./runbook.sh phase_0
+# 3. Smoke tests (fast sanity checks)
+make smokes
 
-# 4. Phase 1 — I-JEPA pretraining (longest job, ~18-24h)
-./runbook.sh phase_1
+# 4. Full pipeline by phases
+make phase0
+make phase1
+make phase2
+make phase3
+make phase4
+make phase5
 
-# 5. Phase 2 & 3 — Feature extraction
-./runbook.sh phase_2
-./runbook.sh phase_3
-
-# 6. Phase 4 — HPO with Optuna
-./runbook.sh phase_4
-
-# 7. Phase 5 — Rigorous 10x10 CV + Wilcoxon test
-./runbook.sh phase_5
-
-# Reattach to any session:
-tmux attach -t ijepa_pretrain
+# Or run everything end-to-end
+make all
 ```
 
 ## Smoke Tests (run before long jobs)
 
 ```bash
-./runbook.sh smoke_data   # requires Phase 0 done
-./runbook.sh smoke_ijepa  # no data needed
-./runbook.sh smoke_cv     # no data needed
+make smokes
+
+# Optional: smoke versions of each phase (tiny jobs + separate outputs)
+make smoke_all
 ```
 
 ## Directory Layout
@@ -52,7 +48,6 @@ tmux attach -t ijepa_pretrain
 │   ├── data/              # Extraction, datamodule, transforms
 │   ├── models/            # I-JEPA adapter, ResNet-50 baseline
 │   └── train/             # Training & feature extraction scripts
-├── scripts/               # Smoke tests
-├── runbook.sh             # Tmux-driven phase launcher
+├── scripts/               # Phase wrappers + smoke tests
 └── requirements.txt
 ```

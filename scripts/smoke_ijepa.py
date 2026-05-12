@@ -7,9 +7,16 @@ on synthetic 10-channel data, checks that loss is a scalar and backward works."
 """
 
 import argparse
+import sys
+from pathlib import Path
 
 import torch
 import yaml
+
+# Ensure project root is on sys.path when running `python scripts/...`.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from src.models.ijepa_adapter import IJEPA
 
