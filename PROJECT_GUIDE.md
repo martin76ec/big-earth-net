@@ -4,7 +4,7 @@
 
 ```bash
 # 1. Install dependencies
-pip install -r requirements.txt
+uv sync
 
 # 2. Put the dataset archive under data/
 #    Example: data/BigEarthNet-S2.tar.zst
